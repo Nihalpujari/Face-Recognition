@@ -1,11 +1,26 @@
 """Dataset loading and canonical-schema harmonization for the age classifier.
 
-Design decision (see project notes):
-    - TRAIN on FairFace only. FairFace is race-balanced by construction, so it
-      stays our clean, balanced anchor for a fairness-critical task.
-    - TEST on UTKFace and Adience as *held-out* datasets the model never saw.
-      Strong cross-dataset generalization is a better responsible-AI story than
-      simply training on more (imbalanced) rows.
+PIVOT (2026-07, recorded honestly rather than silently patched):
+    The originally planned anchor, FairFace, was to be downloaded from Kaggle
+    package "abdulwasay551/fairface-race". On inspection that package has NO
+    age/gender labels anywhere (no CSV; train/val are organized by race-folder
+    only, with plain sequential filenames) and train_aligned/val_aligned turned
+    out to be a MIX of re-hosted UTKFace images (relabeled under race folders)
+    and unlabeled stock photos. None of it is trustworthy ground truth for age.
+    load_fairface() therefore detects this and refuses to silently use it.
+
+    Revised design:
+    - TRAIN + internal validation on UTKFace (age+gender+race all embedded in
+      the filename, verified against real downloaded data). Not race-balanced
+      like real FairFace would have been, but it is genuine, verifiable ground
+      truth, which beats a "balanced" dataset with no usable labels at all.
+    - TEST (external, held-out) on Adience — a different source (Flickr, not
+      UTKFace's source), the model never sees it during training/tuning.
+      Strong performance there is real cross-dataset generalization evidence.
+    - If a properly labeled FairFace (with fairface_label_train/val.csv) is
+      obtained later, load_fairface() already supports it unchanged and it can
+      be added back in as a second external test set, or even swapped back in
+      as the anchor if it arrives balanced and labeled as originally planned.
 
 Every dataset is translated into ONE canonical schema so the rest of the code
 can treat them uniformly. We keep the raw labels alongside the canonical ones
@@ -49,6 +64,28 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------- #
+# Configuration — where the raw data lives.
+# Override with the FACE_AGE_DATA_ROOT environment variable (recommended: set
+# it to wherever you actually extracted the datasets, e.g. a short path like
+# D:/nihal — Windows' 260-char path limit breaks long-filename datasets like
+# Adience if they're nested too deep, e.g. inside this project's own folders).
+#
+# Real layout confirmed against an actual download (folders as Kaggle unpacks
+# them, sitting directly under DATA_ROOT):
+#   utkface/                       23,708 images  age_gender_race_date.jpg.chip.jpg
+#   crop_part1/                     9,780 images  same naming, extra ages
+#   utkface_aligned_cropped/       DO NOT USE — a duplicate wrapper containing
+#                                  copies of utkface/ and crop_part1/ again
+#   adience/
+#     fold_0_data.txt ... fold_4_data.txt        (labels, tab-separated)
+#     AdienceBenchmarkGenderAndAgeClassification/
+#       faces/<user_id>/...                       (the actual images, nested
+#                                                  one level deeper than the
+#                                                  fold files — see load_adience)
+#   fairface/                      SEE PIVOT NOTE ABOVE — this Kaggle mirror
+#                                  has no usable age/gender labels; excluded.
+# --------------------------------------------------------------------------- #
 DATA_ROOT = Path(os.environ.get(
     "FACE_AGE_DATA_ROOT",
     Path(__file__).resolve().parent.parent / "data",
@@ -184,12 +221,14 @@ def load_fairface(root: Path | None = None) -> pd.DataFrame:
         return _empty_frame()
 
     frames = []
+    csvs_found = False
     for split, csv_name in [("train", "fairface_label_train.csv"),
                             ("val", "fairface_label_val.csv")]:
         csv_path = root / csv_name
         if not csv_path.exists():
             logger.warning("FairFace csv missing: %s", csv_path)
             continue
+        csvs_found = True
         df = pd.read_csv(csv_path)
         # FairFace csv columns: file, age, gender, race, service_test
         out = pd.DataFrame()
@@ -208,29 +247,65 @@ def load_fairface(root: Path | None = None) -> pd.DataFrame:
         out["license"] = LICENSES["fairface"]
         frames.append(out)
 
+    if not csvs_found:
+        # Known failure mode: some Kaggle mirrors (e.g. "fairface-race")
+        # repackage FairFace as race-named image folders with NO age/gender
+        # labels, sometimes mixed with re-hosted UTKFace or unlabeled photos.
+        # Folder-name-only "labels" would silently corrupt every downstream
+        # fairness metric, so refuse rather than guess.
+        race_dirs = sorted({d.name for d in root.rglob("*") if d.is_dir()
+                            and d.name in RACE_FINE + ["Asian"]})
+        if race_dirs:
+            logger.error(
+                "FairFace at %s has race-named folders (%s) but NO label "
+                "csv (fairface_label_train.csv / _val.csv). This looks like a "
+                "race-only image dump, not the labeled FairFace release — it "
+                "has no trustworthy age/gender ground truth and will NOT be "
+                "used for training. Get the official FairFace release (with "
+                "the label csvs) if you need it, or proceed without it.",
+                root, race_dirs)
+        return _empty_frame()
     if not frames:
         return _empty_frame()
     df = pd.concat(frames, ignore_index=True)
     return _clean(df, "fairface")
 
 
-def load_utkface(root: Path | None = None) -> pd.DataFrame:
-    """Load UTKFace (held-out test) into the canonical schema.
+def load_utkface(roots: list[Path] | Path | None = None) -> pd.DataFrame:
+    """Load UTKFace — now the TRAIN anchor (see PIVOT note at top of module).
 
     Filenames encode labels as:  age_gender_race_datetime.jpg
         gender: 0=Male, 1=Female
         race:   0=White 1=Black 2=Asian 3=Indian 4=Others
     Malformed / truncated filenames are skipped and counted.
-    """
-    root = Path(root) if root else DATA_ROOT / "utkface"
-    if not root.exists():
-        logger.warning("UTKFace not found at %s — skipping.", root)
-        return _empty_frame()
 
-    # UTKFace ships under a few possible subfolder names; search them all.
-    jpgs = list(root.rglob("*.jpg"))
+    UTKFace's Kaggle package ships the same images under THREE overlapping
+    folders: "utkface" (23,708 imgs), "crop_part1" (9,780 extra imgs, mostly
+    older ages), and "utkface_aligned_cropped" (a wrapper that DUPLICATES both
+    of the above inside it, confirmed by matching file counts). We therefore
+    scan "utkface" + "crop_part1" by default and deliberately do NOT touch
+    "utkface_aligned_cropped" — scanning it too would silently double-count
+    every image.
+    """
+    if roots is None:
+        roots = [DATA_ROOT / "utkface", DATA_ROOT / "crop_part1"]
+    elif isinstance(roots, (str, Path)):
+        roots = [Path(roots)]
+    else:
+        roots = [Path(r) for r in roots]
+
+    jpgs: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            logger.warning("UTKFace: folder not found at %s — skipping it.",
+                            root)
+            continue
+        found = list(root.rglob("*.jpg"))
+        logger.info("UTKFace: found %d .jpg files under %s", len(found), root)
+        jpgs.extend(found)
+
     if not jpgs:
-        logger.warning("UTKFace: no .jpg files under %s", root)
+        logger.warning("UTKFace: no .jpg files found under any of %s", roots)
         return _empty_frame()
 
     gender_map = {"0": "Male", "1": "Female"}
@@ -281,12 +356,18 @@ def load_utkface(root: Path | None = None) -> pd.DataFrame:
     return _clean(pd.DataFrame(rows), "utkface")
 
 
-def load_adience(root: Path | None = None) -> pd.DataFrame:
+def load_adience(root: Path | None = None,
+                 faces_root: Path | None = None) -> pd.DataFrame:
     """Load Adience (held-out test) into the canonical schema.
 
     Adience has age + gender but NO race, so race_fine/race_coarse = "Unknown"
     and these rows must be excluded from race-stratified fairness metrics.
     Labels live in tab-separated fold files (fold_0_data.txt ...).
+
+    On the real download, the fold_*_data.txt files and the actual "faces/"
+    image folder are NOT siblings — the release nests "faces/" one level
+    deeper, inside an inner "AdienceBenchmarkGenderAndAgeClassification/"
+    folder. root/faces_root let you point at each independently.
     """
     root = Path(root) if root else DATA_ROOT / "adience"
     if not root.exists():
@@ -299,7 +380,15 @@ def load_adience(root: Path | None = None) -> pd.DataFrame:
         return _empty_frame()
 
     gender_map = {"m": "Male", "f": "Female"}
-    faces_dir = root / "faces"
+    if faces_root is not None:
+        faces_dir = Path(faces_root)
+    else:
+        # Prefer root/faces if it exists; else the known nested layout.
+        faces_dir = root / "faces"
+        if not faces_dir.exists():
+            nested = root / "AdienceBenchmarkGenderAndAgeClassification" / "faces"
+            if nested.exists():
+                faces_dir = nested
 
     rows, skipped, missing_img = [], 0, 0
     for ff in fold_files:
@@ -423,21 +512,29 @@ def find_duplicates(df: pd.DataFrame,
 
 
 def get_train_test(data_root: Path | None = None):
-    """Return (train_df, test_df) per the project design.
+    """Return (train_df, test_df) per the REVISED project design (see PIVOT
+    note at the top of this module — FairFace as downloaded has no usable
+    age/gender labels, so it is excluded here rather than silently misused).
 
-    train_df = FairFace.
-    test_df  = UTKFace + Adience, kept together but tagged by dataset_source
-               so you can slice per-source at evaluation time.
+    train_df = UTKFace (utkface/ + crop_part1/, deduplicated wrapper excluded).
+    test_df  = Adience — a genuinely external, held-out dataset the model
+               never sees during training. FairFace is loaded too (in case a
+               properly labeled copy is later added) but will simply be empty
+               with the current download, and is NOT included in either split.
     """
     global DATA_ROOT
     if data_root is not None:
         DATA_ROOT = Path(data_root)
 
-    train_df = load_fairface()
-    utk = load_utkface()
-    adi = load_adience()
-    test_df = pd.concat([utk, adi], ignore_index=True) if len(utk) or len(adi) \
-        else _empty_frame()
+    train_df = load_utkface()
+    test_df = load_adience()
+
+    ff = load_fairface()
+    if len(ff):
+        logger.info("FairFace loaded (%d usable rows) — added as a second "
+                    "external test set.", len(ff))
+        test_df = pd.concat([test_df, ff], ignore_index=True) if len(test_df) \
+            else ff
     return train_df, test_df
 
 
