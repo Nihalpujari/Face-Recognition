@@ -28,10 +28,19 @@ Code/face_age/fairface/
 Code/face_age/utkface/
 
 # ========================
+# Test / coverage artifacts
+# ========================
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+
+# ========================
 # Large files (IMPORTANT)
 # ========================
 *.pkl
 *.h5
+*.keras
 *.joblib
 *.model
 
