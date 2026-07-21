@@ -2,8 +2,7 @@
 
 **Course:** Responsible AI and Data Ethics — 2026
 **Institution:** SRH University Heidelberg
-**Supervisor:** Prof. Simon Geschwill
-**Final presentation:** 24 July 2026.
+**Supervisor:** Prof. Simon Geschwill.
 **Dataset:** https://www.kaggle.com/datasets/moritzm00/utkface-cropped
 
 ---
