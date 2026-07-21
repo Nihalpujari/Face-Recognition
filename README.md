@@ -106,7 +106,7 @@ A straightforward MobileNetV2 transfer-learning setup. No augmentation, no stage
 
 ### 4.2 `v7` — Final model
 
-Selected after trying several architectures and training recipes (CNN from scratch, VGG16, ResNet50, EfficientNet, and multiple MobileNetV2 configurations).
+Selected after a seven-version search across architectures, resolutions, augmentation and training recipes — a CNN trained from scratch, EfficientNetB0, and several MobileNetV2 configurations. The full series and its numbers are in §4.3.
 
 ```
 Input 224×224×3, raw [0,255]
@@ -126,6 +126,63 @@ Stage 2:  full unfreeze,     Adam 1e-4,  35 epochs
 **On class weighting.** Computed from the training distribution and passed to `fit()`, so the thin upper age bands are not simply ignored by the optimiser in favour of the dominant 20-29 band.
 
 **On the data pipeline.** Images are held as `uint8` (~4.2 GB for both resolutions, versus ~34 GB as `float64`) and the `tf.data` tensor slices are pinned to CPU. Building the dataset on the GPU caused out-of-memory failures at this dataset size.
+
+### 4.3 The version series — how v7 was arrived at
+
+The final notebook shows two models. **Seven were trained.** The full series is in
+`Code/extra coding notbooks/Responsible_Age_Classifier_week1_3.ipynb`, kept in the repository on
+purpose: the fairness conclusions in §6.3 are only meaningful because they come from **controlled
+pairs**, where one thing changed at a time. Without the series, those claims would be storytelling.
+
+Test set: 3,553 images, 9 classes.
+
+| Version | Backbone | px | Aug | Recipe | Exact acc | One-off | Race gap | Ratio (min/max) |
+|---|---|---|---|---|---|---|---|---|
+| **v1** | MobileNetV2 | 96 | no | A | 47.73% | 86.24% | 14.36 pp | 0.752 |
+| **v2** | MobileNetV2 | 224 | no | A | 51.62% | 88.60% | 19.97 pp | 0.700 |
+| **v3** | EfficientNetB0 | 224 | yes | A | 47.42% | 87.67% | 10.75 pp | 0.804 |
+| **v4** | MobileNetV2 | 224 | **yes** | A | 49.54% | 87.05% | 11.29 pp | 0.805 |
+| **v5** | MobileNetV2 | 224 | yes | A (longer) | 49.90% | 88.40% | 13.50 pp | 0.774 |
+| **v6** | **custom CNN from scratch** | 224 | yes | B | 53.25% | 88.85% | 12.84 pp | 0.794 |
+| **v7** | MobileNetV2 | 224 | yes | **B** | **53.93%** | **89.84%** | 17.91 pp | 0.734 |
+
+**Recipe A** — two-stage transfer with a fixed learning rate.
+**Recipe B** — two-stage transfer plus `ReduceLROnPlateau` on `val_accuracy` and a longer stage-2 budget.
+
+Per-race accuracy for v1–v5 is logged in full in the notebook. Ratios are reported as measured; see §6.2
+on why no pass/fail line is drawn against them.
+
+**The three comparisons that carry the argument**
+
+- **v2 → v4 · the augmentation ablation.** Identical architecture, identical recipe, identical
+  resolution. Augmentation is the *only* difference. Accuracy drops slightly (51.62% → 49.54%) while the
+  race gap nearly halves (**19.97 → 11.29 pp**). This is the cleanest result in the project: a change
+  made for generalisation moved fairness substantially, and cost accuracy to do it.
+
+- **v6 → v7 · pretrained vs. from scratch, same recipe.** A custom CNN with no ImageNet weights reaches
+  **53.25%**; MobileNetV2 with ImageNet weights reaches **53.93%**. **0.68 pp apart.** Both jumped well
+  above the Recipe-A models. The gain came from the *training recipe*, not from the pretrained backbone
+  — on ~20k images the ImageNet prior is worth well under a point. This pair also supplies the Grad-CAM
+  result in §6.4.
+
+- **v1 → v2 · resolution.** 96px to 224px buys ~4 pp of accuracy and **widens** the race gap by 5.6 pp.
+  Higher resolution was not neutral with respect to fairness.
+
+**What the rest of the series shows**
+
+- **v3 (EfficientNetB0)** is the clearest negative result. A larger, more modern backbone produced the
+  *lowest* exact accuracy in the series (47.42%) alongside the *narrowest* race gap (10.75 pp) — it
+  underfit fairly rather than performing well. Worth keeping precisely because it breaks the assumption
+  that the accuracy ranking and the fairness ranking move together. They do not: across the series the
+  correlation runs the *wrong* way, with the two most accurate models (v6, v7) carrying wider gaps than
+  v3 and v4.
+- **v5** tests whether v4 simply needed more epochs. It does not: +0.36 pp accuracy for roughly double
+  the training, and the race gap moves back up to 13.50 pp.
+
+**A caveat, stated plainly.** Seven versions were evaluated on the test set and one was selected on the
+strength of those comparisons. That is **selection on the test set**, and the reported v7 figures are
+therefore mildly optimistic. Publishing the whole series rather than only the winner is the partial
+remedy — a reader can see exactly how much searching produced the headline number.
 
 ---
 
@@ -183,11 +240,11 @@ Gaps are reported with **bootstrap confidence intervals**, so a gap driven by a 
 **Augmentation is a fairness intervention, not just a regularisation trick.**
 A controlled ablation (identical architecture, augmentation the only difference) cut the race accuracy gap from **19.97 pp to 11.29 pp**. Nothing about that change was fairness-motivated in intent — which is exactly why it needed to be measured.
 
-**Training schedule, not architecture, produced the gains.**
-Two models differing only in initialisation landed **0.68 pp** apart. The improvements over the baseline came from the two-stage unfreezing and the LR schedule.
+**The training recipe mattered more than the pretrained backbone.**
+A CNN trained from scratch (v6, 53.25%) landed **0.68 pp** below ImageNet-pretrained MobileNetV2 (v7, 53.93%) under the same Recipe B — and both sat 3-4 pp above every Recipe-A model. On a dataset of this size the ImageNet prior is worth under a point; the two-stage unfreeze and the LR schedule are worth several.
 
-**Pretrained backbones memorise.**
-Train/validation accuracy gap of **24.1 pp** on one variant versus **3.3 pp** on another — worth stating plainly rather than reporting only the headline test number.
+**Accuracy and fairness did not move together.**
+Across the series the most accurate models carry the *widest* race gaps (v7: 53.93% / 17.91 pp) while the least accurate carries the narrowest (v3: 47.42% / 10.75 pp). Selecting on accuracy alone would have selected against fairness — which is the argument for auditing both rather than optimising one.
 
 **The best-represented group is not the best-served group.**
 White faces in the 20-29 band — the single largest cell in the dataset (n ≈ 307 in test) — score around **40%**, while every other race in that same band scores **59-60%**. More data did not mean better performance. This is the finding that most directly contradicts the intuitive "just collect more data" fix.
@@ -200,14 +257,14 @@ White faces in the 20-29 band — the single largest cell in the dataset (n ≈ 
 
 Grad-CAM takes the gradient of the predicted class with respect to the final convolutional feature map, producing a heatmap of which facial regions drove the decision. Applied to **baseline v1 versus final v7**, and to controlled version pairs, with per-race attention profiles aggregated over thirds of the image.
 
-**The result, replicated across two independent controlled pairs:**
+**The result, replicated across two independent model pairs:**
 
 > The model with the **more uniform** cross-race attention distribution has the **wider** accuracy gap.
 
-One model: attention spread **6.67**, accuracy gap **17.91 pp**.
-The other: attention spread **20.43**, accuracy gap **12.84 pp**.
+**v7** (MobileNetV2): attention spread **6.67**, race gap **17.91 pp**.
+**v6** (scratch CNN): attention spread **20.43**, race gap **12.84 pp**.
 
-Same direction in both pairs.
+v7 looks *far* more even-handed under Grad-CAM — it attends to nearly the same facial regions regardless of race — and it is the model with the wider outcome disparity. The v2 → v4 pair moves in the same direction.
 
 **Why this matters.** There is a comfortable assumption in applied XAI that if a model attends to the same regions across demographic groups, it is treating them equally. This project's data says that inference does not hold. **Spatial attention uniformity is not a sufficient fairness diagnostic.** An explainability visualisation can look reassuring while the outcome disparity gets worse. XAI and fairness auditing are complementary — one cannot substitute for the other.
 
@@ -297,6 +354,6 @@ Three claims, each supported by a measurement in the notebook rather than by ass
 
 1. **A fairness-relevant intervention need not be fairness-motivated.** Augmentation was added for generalisation and cut the race gap by nearly half. The converse is also true, and more dangerous: routine engineering decisions can widen disparities without anyone intending it or noticing.
 
-2. **Explainability is not a fairness guarantee.** Across two controlled pairs, more uniform Grad-CAM attention accompanied *wider* outcome gaps. A visualisation that looks fair is not evidence that the model is fair.
+2. **Explainability is not a fairness guarantee.** Across two model pairs, more uniform Grad-CAM attention accompanied *wider* outcome gaps. A visualisation that looks fair is not evidence that the model is fair.
 
 3. **The honest response to an uncertain model is to let it abstain.** Rather than tuning a 54%-accurate classifier until its confident-looking output could be shipped, the system routes its own uncertainty to a human. Human oversight is a code path, not a policy paragraph.
