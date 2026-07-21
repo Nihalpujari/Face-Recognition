@@ -1,6 +1,6 @@
 # Responsible Age Classification for Age-Restricted Sales
 
-**Course:** Responsible AI and Data Ethics — SS 2026
+**Course:** Responsible AI and Data Ethics — 2026
 **Institution:** SRH University Heidelberg
 **Supervisor:** Prof. Simon Geschwill
 **Final presentation:** 24 July 2026.
